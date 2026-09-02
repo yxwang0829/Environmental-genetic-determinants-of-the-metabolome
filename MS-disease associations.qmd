@@ -1,0 +1,183 @@
+---
+title: "Metabolomic-signature associations with lifestyle components and incident diseases"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+  library(survival)
+})
+
+signature_path <- "results/07_signature/signature_predictions.tsv"
+score_path <- "data/healthy_lifestyle_scores.tsv"
+disease_dir <- "data/diseases"
+white_id_path <- "data/white_british_ids.txt"
+covariate_path <- "data/covariates.tsv"
+result_dir <- "results/08_signature_disease"
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+case_frequency_cutoff <- 0.001
+component_names <- c(
+  "smoking_behavior_score",
+  "alcohol_consumption_score",
+  "physical_activity_score",
+  "sleep_duration_score",
+  "sedentary_behavior_score",
+  "social_contact_score",
+  "diet_score"
+)
+```
+
+## Signature-component associations
+
+```{r}
+signature_df <- readr::read_tsv(signature_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+score_df <- readr::read_tsv(score_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(eid))
+
+component_df <- signature_df |>
+  inner_join(score_df, by = "eid") |>
+  mutate(meta_signal_z = as.numeric(scale(meta_signal)))
+
+signature_component_results <- map_dfr(component_names, function(component) {
+  model_df <- component_df |>
+    select(meta_signal_z, all_of(component)) |>
+    drop_na()
+  model_fit <- lm(
+    reformulate(component, response = "meta_signal_z"),
+    data = model_df
+  )
+
+  broom::tidy(model_fit, conf.int = TRUE) |>
+    filter(term == component) |>
+    transmute(
+      component = component,
+      estimate,
+      std.error,
+      statistic,
+      p.value,
+      conf.low,
+      conf.high,
+      n = nobs(model_fit)
+    )
+})
+
+readr::write_csv(
+  signature_component_results,
+  file.path(result_dir, "signature_component_associations.csv")
+)
+```
+
+## Incident-disease selection
+
+```{r}
+read_disease <- function(path) {
+  disease_raw <- readr::read_csv(path, show_col_types = FALSE)
+  if (all(c("eid", "status", "years") %in% names(disease_raw))) {
+    disease_raw |>
+      transmute(
+        eid = as.character(eid),
+        status = as.numeric(status),
+        years = as.numeric(years)
+      )
+  } else {
+    disease_raw |>
+      transmute(
+        eid = as.character(eid),
+        status = as.numeric(target_y),
+        years = as.numeric(BL2Target_yrs)
+      )
+  }
+}
+
+white_ids <- readr::read_lines(white_id_path)
+eligible_ids <- intersect(signature_df$eid, white_ids)
+disease_files <- list.files(
+  disease_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+disease_summary <- map_dfr(disease_files, function(path) {
+  disease_df <- read_disease(path) |>
+    filter(eid %in% eligible_ids, years >= 0) |>
+    drop_na(status, years)
+
+  tibble(
+    disease = tools::file_path_sans_ext(basename(path)),
+    path = path,
+    total_n = nrow(disease_df),
+    case_n = sum(disease_df$status == 1),
+    control_n = sum(disease_df$status == 0),
+    case_freq = case_n / total_n
+  )
+})
+
+selected_diseases <- disease_summary |>
+  filter(case_freq > case_frequency_cutoff)
+
+readr::write_csv(
+  selected_diseases,
+  file.path(result_dir, "selected_incident_diseases.csv")
+)
+```
+
+## Signature-disease Cox models
+
+```{r}
+covariate_df <- readr::read_tsv(covariate_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+covariates <- intersect(
+  c("Sex", "Age", "Fasting", "Month", "Center"),
+  names(covariate_df)
+)
+
+signature_disease_results <- pmap_dfr(
+  selected_diseases |> select(disease, path),
+  function(disease, path) {
+    model_df <- read_disease(path) |>
+      filter(eid %in% eligible_ids, years >= 0) |>
+      inner_join(covariate_df, by = "eid") |>
+      inner_join(signature_df |> select(eid, meta_signal), by = "eid") |>
+      drop_na(status, years, meta_signal, all_of(covariates)) |>
+      mutate(
+        meta_signal = as.numeric(scale(meta_signal)),
+        across(any_of(c("Month", "Center")), as.factor)
+      )
+
+    model_fit <- coxph(
+      reformulate(
+        c(covariates, "meta_signal"),
+        response = "survival::Surv(years, status)"
+      ),
+      data = model_df
+    )
+
+    broom::tidy(model_fit, exponentiate = TRUE, conf.int = TRUE) |>
+      filter(term == "meta_signal") |>
+      transmute(
+        disease = disease,
+        HR = estimate,
+        HR_lower = conf.low,
+        HR_upper = conf.high,
+        p.value,
+        n = nobs(model_fit),
+        events = sum(model_df$status == 1)
+      )
+  }
+)
+
+readr::write_tsv(
+  signature_disease_results,
+  file.path(result_dir, "signature_incident_disease.tsv")
+)
+```
+

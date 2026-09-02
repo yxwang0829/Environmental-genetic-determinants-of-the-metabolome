@@ -1,0 +1,176 @@
+---
+title: "Exposome-wide association analysis"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+  library(fastDummies)
+})
+
+data_dir <- "data"
+result_dir <- "results/01_ewas"
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+metabolome_path <- file.path(data_dir, "metabolome.tsv")
+covariate_path <- file.path(data_dir, "covariates.tsv")
+exposure_path <- file.path(data_dir, "exposure_phenotypes.rds")
+discovery_id_path <- file.path(data_dir, "discovery_ids.txt")
+replication_id_path <- file.path(data_dir, "replication_ids.txt")
+replicated_ewas_path <- file.path(data_dir, "replicated_ewas.tsv")
+```
+
+## Exposure preprocessing
+
+```{r}
+remove_outliers_and_scale <- function(x) {
+  x_median <- median(x, na.rm = TRUE)
+  x_iqr <- IQR(x, na.rm = TRUE)
+  x[x < x_median - 4 * x_iqr | x > x_median + 4 * x_iqr] <- NA_real_
+  as.numeric(scale(x))
+}
+
+quote_name <- function(x) {
+  paste0("`", gsub("`", "", x, fixed = TRUE), "`")
+}
+
+exposure_list <- readRDS(exposure_path)
+
+binary_df <- exposure_list$Binary_phenotype
+ordinal_df <- exposure_list$CatOrd_phenotype
+
+nominal_df <- exposure_list$CatUnord_phenotype |>
+  fastDummies::dummy_columns(
+    select_columns = setdiff(names(exposure_list$CatUnord_phenotype), "eid"),
+    remove_selected_columns = TRUE,
+    ignore_na = TRUE
+  )
+
+continuous_df <- exposure_list$Cont_phenotype |>
+  mutate(across(-eid, remove_outliers_and_scale))
+
+exposure_df <- list(binary_df, ordinal_df, nominal_df, continuous_df) |>
+  reduce(full_join, by = "eid")
+```
+
+## Assemble discovery and replication datasets
+
+```{r}
+metabolome_df <- readr::read_tsv(metabolome_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+
+covariate_df <- readr::read_tsv(covariate_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+
+exposure_df <- exposure_df |>
+  mutate(eid = as.character(eid))
+
+analysis_df <- metabolome_df |>
+  inner_join(covariate_df, by = c("IID", "eid"), suffix = c("", "_covariate")) |>
+  inner_join(exposure_df, by = "eid") |>
+  mutate(
+    across(any_of(c("Ethnicity", "Month", "Center")), as.factor)
+  )
+
+discovery_ids <- readr::read_lines(discovery_id_path)
+replication_ids <- readr::read_lines(replication_id_path)
+
+discovery_df <- analysis_df |> filter(eid %in% discovery_ids)
+replication_df <- analysis_df |> filter(eid %in% replication_ids)
+
+saveRDS(
+  bind_rows(discovery_df, replication_df),
+  file.path(result_dir, "ewas_analysis_matrix.rds")
+)
+```
+
+## Serial metabolite-exposure models
+
+```{r}
+metabolites <- setdiff(names(metabolome_df), c("FID", "IID", "eid"))
+covariates <- intersect(
+  c("Sex", "Age", "Fasting", "Month", "Center"),
+  names(analysis_df)
+)
+exposures <- setdiff(
+  names(exposure_df),
+  c("FID", "IID", "eid")
+)
+
+fit_ewas <- function(data, metabolite, exposure, covariates) {
+  model_columns <- c(metabolite, exposure, covariates)
+  model_df <- data |>
+    select(all_of(model_columns)) |>
+    drop_na()
+
+  variable_covariates <- covariates[
+    vapply(model_df[covariates], dplyr::n_distinct, integer(1)) > 1
+  ]
+
+  model_formula <- reformulate(
+    c(variable_covariates, quote_name(exposure)),
+    response = quote_name(metabolite)
+  )
+  model_fit <- lm(model_formula, data = model_df)
+
+  broom::tidy(model_fit, conf.int = TRUE) |>
+    filter(stringr::str_remove_all(term, "`") == exposure) |>
+    transmute(
+      Metabolite = metabolite,
+      Exposure = exposure,
+      estimate,
+      std.error,
+      statistic,
+      p.value,
+      conf.low,
+      conf.high,
+      n = nobs(model_fit)
+    )
+}
+
+run_ewas <- function(data) {
+  tidyr::crossing(Metabolite = metabolites, Exposure = exposures) |>
+    mutate(
+      result = map2(
+        Metabolite,
+        Exposure,
+        ~ fit_ewas(data, .x, .y, covariates)
+      )
+    ) |>
+    select(result) |>
+    unnest(result)
+}
+
+discovery_results <- run_ewas(discovery_df)
+replication_results <- run_ewas(replication_df)
+
+readr::write_tsv(
+  discovery_results,
+  file.path(result_dir, "discovery_ewas.tsv")
+)
+readr::write_tsv(
+  replication_results,
+  file.path(result_dir, "replication_ewas.tsv")
+)
+```
+
+## Replicated associations used downstream
+
+```{r}
+replicated_ewas <- readr::read_tsv(
+  replicated_ewas_path,
+  show_col_types = FALSE
+)
+
+readr::write_tsv(
+  replicated_ewas,
+  file.path(result_dir, "replicated_ewas.tsv")
+)
+```

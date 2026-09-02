@@ -1,0 +1,204 @@
+---
+title: "Metabolite associations with incident diseases and all-cause mortality"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+  library(survival)
+})
+
+disease_dir <- "data/diseases"
+metabolome_path <- "data/metabolome.tsv"
+white_id_path <- "data/white_british_ids.txt"
+covariate_path <- "data/covariates.tsv"
+mortality_path <- "data/all_cause_mortality.tsv"
+result_dir <- "results/05_metabolite_disease"
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+case_frequency_cutoff <- 0.001
+
+quote_name <- function(x) {
+  paste0("`", gsub("`", "", x, fixed = TRUE), "`")
+}
+```
+
+## Inputs
+
+```{r}
+metabolome_df <- readr::read_tsv(metabolome_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+
+white_ids <- readr::read_lines(white_id_path)
+
+covariate_df <- readr::read_tsv(covariate_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+
+metabolites <- setdiff(names(metabolome_df), c("FID", "IID", "eid"))
+covariates <- intersect(
+  c("Sex", "Age", "Fasting", "Month", "Center"),
+  names(covariate_df)
+)
+eligible_ids <- intersect(metabolome_df$eid, white_ids)
+```
+
+## Incident-disease selection
+
+```{r}
+read_disease <- function(path) {
+  disease_raw <- readr::read_csv(path, show_col_types = FALSE)
+
+  if (all(c("eid", "status", "years") %in% names(disease_raw))) {
+    disease_raw |>
+      transmute(
+        eid = as.character(eid),
+        status = as.numeric(status),
+        years = as.numeric(years)
+      )
+  } else {
+    disease_raw |>
+      transmute(
+        eid = as.character(eid),
+        status = as.numeric(target_y),
+        years = as.numeric(BL2Target_yrs)
+      )
+  }
+}
+
+disease_files <- list.files(
+  disease_dir,
+  pattern = "\\.csv$",
+  full.names = TRUE
+)
+
+disease_summary <- map_dfr(disease_files, function(path) {
+  disease_df <- read_disease(path) |>
+    filter(eid %in% eligible_ids, years >= 0) |>
+    drop_na(status, years)
+
+  tibble(
+    disease = tools::file_path_sans_ext(basename(path)),
+    path = path,
+    total_n = nrow(disease_df),
+    case_n = sum(disease_df$status == 1),
+    control_n = sum(disease_df$status == 0),
+    case_freq = case_n / total_n
+  )
+})
+
+selected_diseases <- disease_summary |>
+  filter(case_freq > case_frequency_cutoff)
+
+readr::write_csv(
+  selected_diseases,
+  file.path(result_dir, "selected_incident_diseases.csv")
+)
+```
+
+## Metabolite-disease Cox models
+
+```{r}
+fit_metabolite_cox <- function(disease_name, disease_path, metabolite) {
+  disease_df <- read_disease(disease_path) |>
+    filter(eid %in% eligible_ids, years >= 0)
+
+  model_df <- disease_df |>
+    inner_join(covariate_df, by = "eid") |>
+    inner_join(
+      metabolome_df |> select(eid, all_of(metabolite)),
+      by = "eid"
+    ) |>
+    drop_na(status, years, all_of(covariates), all_of(metabolite)) |>
+    mutate(across(any_of(c("Month", "Center")), as.factor))
+
+  model_formula <- reformulate(
+    c(covariates, quote_name(metabolite)),
+    response = "survival::Surv(years, status)"
+  )
+  model_fit <- survival::coxph(model_formula, data = model_df)
+
+  broom::tidy(model_fit, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(stringr::str_remove_all(term, "`") == metabolite) |>
+    transmute(
+      disease = disease_name,
+      metabolite = metabolite,
+      HR = estimate,
+      HR_lower = conf.low,
+      HR_upper = conf.high,
+      p.value,
+      n = nobs(model_fit),
+      events = sum(model_df$status == 1)
+    )
+}
+
+metabolite_disease_results <- pmap_dfr(
+  selected_diseases |> select(disease, path),
+  function(disease, path) {
+    map_dfr(
+      metabolites,
+      ~ fit_metabolite_cox(disease, path, .x)
+    )
+  }
+)
+
+readr::write_tsv(
+  metabolite_disease_results,
+  file.path(result_dir, "metabolite_incident_disease.tsv")
+)
+```
+
+## All-cause mortality
+
+```{r}
+mortality_df <- readr::read_tsv(mortality_path, show_col_types = FALSE) |>
+  transmute(
+    eid = as.character(IID),
+    status = as.numeric(ACM_event_indicator),
+    time = as.numeric(ACM_survival_time)
+  ) |>
+  filter(eid %in% eligible_ids, time >= 0)
+
+metabolite_mortality_results <- map_dfr(metabolites, function(metabolite) {
+  model_df <- mortality_df |>
+    inner_join(covariate_df, by = "eid") |>
+    inner_join(
+      metabolome_df |> select(eid, all_of(metabolite)),
+      by = "eid"
+    ) |>
+    drop_na(status, time, all_of(covariates), all_of(metabolite)) |>
+    mutate(across(any_of(c("Month", "Center")), as.factor))
+
+  model_fit <- coxph(
+    reformulate(
+      c(covariates, quote_name(metabolite)),
+      response = "survival::Surv(time, status)"
+    ),
+    data = model_df
+  )
+
+  broom::tidy(model_fit, exponentiate = TRUE, conf.int = TRUE) |>
+    filter(stringr::str_remove_all(term, "`") == metabolite) |>
+    transmute(
+      outcome = "all_cause_mortality",
+      metabolite = metabolite,
+      HR = estimate,
+      HR_lower = conf.low,
+      HR_upper = conf.high,
+      p.value,
+      n = nobs(model_fit),
+      events = sum(model_df$status == 1)
+    )
+})
+
+readr::write_tsv(
+  metabolite_mortality_results,
+  file.path(result_dir, "metabolite_all_cause_mortality.tsv")
+)
+```

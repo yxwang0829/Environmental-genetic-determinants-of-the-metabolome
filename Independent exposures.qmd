@@ -1,0 +1,210 @@
+---
+title: "Identification of independent exposures"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(car)
+  library(caret)
+  library(broom)
+})
+
+analysis_matrix_path <- "results/01_ewas/ewas_analysis_matrix.rds"
+replicated_ewas_path <- "data/replicated_ewas.tsv"
+exposure_metadata_path <- "data/exposure_metadata.csv"
+result_dir <- "results/02_independent_exposures"
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+correlation_cutoff <- 0.90
+vif_cutoff <- 3
+p_cutoff <- 1e-6
+cluster_fraction <- 0.30
+
+quote_name <- function(x) {
+  paste0("`", gsub("`", "", x, fixed = TRUE), "`")
+}
+```
+
+## Inputs and min-max scaling
+
+```{r}
+analysis_df <- readRDS(analysis_matrix_path)
+replicated_ewas <- readr::read_tsv(
+  replicated_ewas_path,
+  show_col_types = FALSE
+)
+exposure_metadata <- readr::read_csv(
+  exposure_metadata_path,
+  show_col_types = FALSE
+)
+
+exposures <- unique(replicated_ewas$Exposure)
+
+minmax_scale <- function(x) {
+  (x - min(x, na.rm = TRUE)) /
+    (max(x, na.rm = TRUE) - min(x, na.rm = TRUE))
+}
+
+analysis_df <- analysis_df |>
+  mutate(across(all_of(exposures), minmax_scale))
+
+exposure_sex <- exposure_metadata |>
+  transmute(
+    FieldID = as.character(FieldID),
+    Sexed = as.character(Sexed)
+  )
+```
+
+## Exposure clustering
+
+```{r}
+cluster_exposures <- function(data, metabolite_exposures) {
+  field_ids <- stringr::str_split_i(metabolite_exposures, "#", 1)
+  sex_labels <- exposure_sex$Sexed[match(field_ids, exposure_sex$FieldID)]
+
+  sex_specific <- metabolite_exposures[sex_labels %in% c("Male", "Female")]
+  general <- setdiff(metabolite_exposures, sex_specific)
+
+  cluster_rows <- tibble(exposure = character(), cluster_id = integer())
+
+  if (length(general) == 1) {
+    cluster_rows <- tibble(exposure = general, cluster_id = 1L)
+  }
+
+  if (length(general) > 1) {
+    exposure_matrix <- data |>
+      select(all_of(general)) |>
+      as.matrix() |>
+      t()
+
+    clustering <- hclust(dist(exposure_matrix), method = "ward.D2")
+    cut_index <- length(general) - ceiling(length(general) * cluster_fraction)
+    cut_height <- clustering$height[cut_index]
+    cluster_rows <- tibble(
+      exposure = names(cutree(clustering, h = cut_height)),
+      cluster_id = unname(cutree(clustering, h = cut_height))
+    )
+  }
+
+  next_cluster <- if (nrow(cluster_rows) == 0) 0L else max(cluster_rows$cluster_id)
+  female_exposures <- metabolite_exposures[sex_labels == "Female"]
+  male_exposures <- metabolite_exposures[sex_labels == "Male"]
+
+  bind_rows(
+    cluster_rows,
+    tibble(exposure = female_exposures, cluster_id = next_cluster + 1L),
+    tibble(exposure = male_exposures, cluster_id = next_cluster + 2L)
+  )
+}
+```
+
+## Correlation, VIF, and P-value filtering
+
+```{r}
+filter_correlation <- function(data, exposure_names) {
+  if (length(exposure_names) < 2) return(exposure_names)
+  correlation_matrix <- cor(
+    data[, exposure_names, drop = FALSE],
+    use = "pairwise.complete.obs"
+  )
+  remove_index <- caret::findCorrelation(
+    correlation_matrix,
+    cutoff = correlation_cutoff
+  )
+  if (length(remove_index) == 0) return(exposure_names)
+  exposure_names[-remove_index]
+}
+
+filter_vif <- function(data, metabolite, exposure_names) {
+  retained <- exposure_names
+  while (length(retained) > 1) {
+    model_df <- data |>
+      select(all_of(c(metabolite, retained))) |>
+      drop_na()
+    model_fit <- lm(
+      reformulate(quote_name(retained), quote_name(metabolite)),
+      data = model_df
+    )
+    vif_values <- car::vif(model_fit)
+    names(vif_values) <- stringr::str_remove_all(names(vif_values), "`")
+    if (max(vif_values) <= vif_cutoff) break
+    retained <- setdiff(retained, names(which.max(vif_values)))
+  }
+  retained
+}
+
+filter_pvalue <- function(data, metabolite, exposure_names, covariates) {
+  retained <- exposure_names
+  while (length(retained) > 1) {
+    model_df <- data |>
+      select(all_of(c(metabolite, retained, covariates))) |>
+      drop_na()
+    model_fit <- lm(
+      reformulate(c(covariates, quote_name(retained)), quote_name(metabolite)),
+      data = model_df
+    )
+    exposure_p <- broom::tidy(model_fit) |>
+      mutate(term = stringr::str_remove_all(term, "`")) |>
+      filter(term %in% retained) |>
+      select(term, p.value)
+    if (all(exposure_p$p.value <= p_cutoff)) break
+    retained <- setdiff(retained, exposure_p$term[which.max(exposure_p$p.value)])
+  }
+  retained
+}
+
+covariates <- intersect(
+  c("Sex", "Age", "Fasting", "Month", "Center"),
+  names(analysis_df)
+)
+
+independent_exposures <- map_dfr(
+  unique(replicated_ewas$Metabolite),
+  function(metabolite) {
+    metabolite_exposures <- replicated_ewas |>
+      filter(Metabolite == metabolite) |>
+      pull(Exposure) |>
+      unique()
+
+    clusters <- cluster_exposures(analysis_df, metabolite_exposures)
+
+    clusters |>
+      group_by(cluster_id) |>
+      summarise(
+        retained = list({
+          after_correlation <- filter_correlation(
+            analysis_df,
+            exposure
+          )
+          after_vif <- filter_vif(
+            analysis_df,
+            metabolite,
+            after_correlation
+          )
+          filter_pvalue(
+            analysis_df,
+            metabolite,
+            after_vif,
+            covariates
+          )
+        }),
+        .groups = "drop"
+      ) |>
+      unnest_longer(retained, values_to = "Exposure") |>
+      mutate(Metabolite = metabolite)
+  }
+) |>
+  left_join(replicated_ewas, by = c("Metabolite", "Exposure"))
+
+readr::write_tsv(
+  independent_exposures,
+  file.path(result_dir, "independent_exposures.tsv")
+)
+```

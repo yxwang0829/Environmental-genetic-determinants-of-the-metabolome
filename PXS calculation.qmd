@@ -1,0 +1,112 @@
+---
+title: "Polyexposure score calculation"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(tidyverse)
+})
+
+heldout_exposure_path <- "data/heldout_exposures.tsv"
+independent_exposure_path <- "results/02_independent_exposures/independent_exposures.tsv"
+result_dir <- "results/03_pxs"
+group_result_dir <- file.path(result_dir, "group_pxs_z")
+dir.create(group_result_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Score functions
+
+```{r}
+zscore <- function(x) {
+  (x - mean(x, na.rm = TRUE)) / sd(x, na.rm = TRUE)
+}
+
+compute_weighted_score <- function(exposure_dt, exposure_cols, betas) {
+  exposure_matrix <- as.matrix(exposure_dt[, ..exposure_cols])
+  contribution_matrix <- sweep(exposure_matrix, 2L, betas, `*`)
+  non_missing_n <- rowSums(!is.na(exposure_matrix))
+  weighted_score <- rowSums(contribution_matrix, na.rm = TRUE) / non_missing_n
+  weighted_score[non_missing_n == 0] <- NA_real_
+  as.numeric(weighted_score)
+}
+```
+
+## Total PXS
+
+```{r}
+exposure_dt <- data.table::fread(heldout_exposure_path, check.names = FALSE)
+mapping_dt <- data.table::fread(independent_exposure_path, check.names = FALSE)
+
+metabolites <- unique(mapping_dt$Metabolite)
+
+total_pxs_dt <- data.table(IID = exposure_dt$IID)
+for (metabolite in metabolites) {
+  metabolite_mapping <- mapping_dt[Metabolite == metabolite]
+  total_pxs_dt[[metabolite]] <- compute_weighted_score(
+    exposure_dt,
+    metabolite_mapping$Exposure,
+    metabolite_mapping$discovery_estimate
+  )
+}
+
+total_pxs_z_dt <- copy(total_pxs_dt)
+total_pxs_z_dt[, (metabolites) := lapply(.SD, zscore), .SDcols = metabolites]
+
+data.table::fwrite(
+  total_pxs_dt,
+  file.path(result_dir, "total_pxs_raw.tsv"),
+  sep = "\t"
+)
+data.table::fwrite(
+  total_pxs_z_dt,
+  file.path(result_dir, "total_pxs_z.tsv"),
+  sep = "\t"
+)
+```
+
+## Exposure-group PXS
+
+```{r}
+groups <- unique(mapping_dt$Category)
+
+group_manifest <- map_dfr(groups, function(group_name) {
+  group_key <- group_name |>
+    str_to_lower() |>
+    str_replace_all("[^a-z0-9]+", "_") |>
+    str_replace_all("^_+|_+$", "")
+
+  group_pxs_dt <- data.table(IID = exposure_dt$IID)
+  for (metabolite in metabolites) {
+    metabolite_mapping <- mapping_dt[
+      Metabolite == metabolite & Category == group_name
+    ]
+    if (nrow(metabolite_mapping) == 0) {
+      group_pxs_dt[[metabolite]] <- NA_real_
+    } else {
+      group_pxs_dt[[metabolite]] <- compute_weighted_score(
+        exposure_dt,
+        metabolite_mapping$Exposure,
+        metabolite_mapping$discovery_estimate
+      )
+    }
+  }
+
+  group_pxs_dt[, (metabolites) := lapply(.SD, zscore), .SDcols = metabolites]
+  output_path <- file.path(group_result_dir, paste0(group_key, ".tsv"))
+  data.table::fwrite(group_pxs_dt, output_path, sep = "\t")
+
+  tibble(group = group_name, group_key = group_key, path = output_path)
+})
+
+readr::write_tsv(
+  group_manifest,
+  file.path(result_dir, "group_pxs_manifest.tsv")
+)
+```

@@ -1,0 +1,191 @@
+---
+title: "Held-out metabolite prediction models"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(data.table)
+  library(tidyverse)
+  library(rms)
+})
+
+metabolome_path <- "data/heldout_metabolome.tsv"
+covariate_path <- "data/heldout_covariates.tsv"
+prs_path <- "data/heldout_prs.tsv"
+total_pxs_path <- "results/03_pxs/total_pxs_z.tsv"
+group_manifest_path <- "results/03_pxs/group_pxs_manifest.tsv"
+result_dir <- "results/04_prediction_models"
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+```
+
+## Five prediction models
+
+```{r}
+fit_metrics <- function(formula_obj, data) {
+  model_fit <- lm(formula_obj, data = data)
+  model_summary <- summary(model_fit)
+  tibble(
+    n = nobs(model_fit),
+    r2 = model_summary$r.squared,
+    adjusted_r2 = model_summary$adj.r.squared
+  )
+}
+
+metabolome_dt <- fread(metabolome_path, check.names = FALSE)
+covariate_dt <- fread(covariate_path, check.names = FALSE)
+prs_dt <- fread(prs_path, check.names = FALSE)
+total_pxs_dt <- fread(total_pxs_path, check.names = FALSE)
+
+metabolites <- setdiff(names(metabolome_dt), "IID")
+
+model_results <- map_dfr(metabolites, function(metabolite) {
+  common_prs <- paste0(metabolite, "_common_variant_PRS")
+  rare_prs <- paste0(metabolite, "_rare_variant_PRS")
+
+  model_df <- tibble(
+    Y = metabolome_dt[[metabolite]],
+    Age = covariate_dt$Age,
+    Sex = factor(covariate_dt$Sex),
+    PRS_common = prs_dt[[common_prs]],
+    PRS_rare = prs_dt[[rare_prs]],
+    total_PXS_z = total_pxs_dt[[metabolite]]
+  ) |>
+    drop_na()
+
+  model_spec <- list(
+    Model0 = Y ~ Age + Sex,
+    Model0b = Y ~ Age + Sex + total_PXS_z,
+    Model1 = Y ~ Age + Sex + PRS_common,
+    Model2 = Y ~ Age + Sex + PRS_common + PRS_rare,
+    Model3 = Y ~ Age + Sex + PRS_common + PRS_rare + total_PXS_z
+  )
+
+  map_dfr(names(model_spec), function(model_name) {
+    fit_metrics(model_spec[[model_name]], model_df) |>
+      mutate(metabolite = metabolite, model = model_name)
+  }) |>
+    mutate(
+      delta_r2 = c(
+        NA_real_,
+        r2[model == "Model0b"] - r2[model == "Model0"],
+        r2[model == "Model1"] - r2[model == "Model0"],
+        r2[model == "Model2"] - r2[model == "Model1"],
+        r2[model == "Model3"] - r2[model == "Model2"]
+      )
+    )
+})
+
+readr::write_tsv(
+  model_results,
+  file.path(result_dir, "model_metrics.tsv")
+)
+```
+
+## Exposure-group models
+
+```{r}
+group_manifest <- readr::read_tsv(group_manifest_path, show_col_types = FALSE)
+
+group_model_results <- pmap_dfr(group_manifest, function(group, group_key, path) {
+  group_pxs_dt <- fread(path, check.names = FALSE)
+
+  map_dfr(metabolites, function(metabolite) {
+    common_prs <- paste0(metabolite, "_common_variant_PRS")
+    rare_prs <- paste0(metabolite, "_rare_variant_PRS")
+
+    model_df <- tibble(
+      Y = metabolome_dt[[metabolite]],
+      Age = covariate_dt$Age,
+      Sex = factor(covariate_dt$Sex),
+      PRS_common = prs_dt[[common_prs]],
+      PRS_rare = prs_dt[[rare_prs]],
+      group_PXS_z = group_pxs_dt[[metabolite]]
+    ) |>
+      drop_na()
+
+    baseline_fit <- fit_metrics(Y ~ Age + Sex, model_df)
+    exposure_fit <- fit_metrics(Y ~ Age + Sex + group_PXS_z, model_df)
+    genetic_fit <- fit_metrics(
+      Y ~ Age + Sex + PRS_common + PRS_rare + group_PXS_z,
+      model_df
+    )
+
+    bind_rows(
+      exposure_fit |> mutate(model = "age_sex_group_pxs"),
+      genetic_fit |> mutate(model = "age_sex_prs_group_pxs")
+    ) |>
+      mutate(
+        metabolite = metabolite,
+        group = group,
+        delta_r2_from_age_sex = r2 - baseline_fit$r2
+      )
+  })
+})
+
+readr::write_tsv(
+  group_model_results,
+  file.path(result_dir, "group_model_metrics.tsv")
+)
+```
+
+## Wald chi-square relative importance
+
+```{r}
+extract_total <- function(anova_table) {
+  tibble(
+    chisq = unname(anova_table["TOTAL", "Chi-Square"]),
+    df = unname(anova_table["TOTAL", "d.f."]),
+    p = unname(anova_table["TOTAL", "P"])
+  )
+}
+
+wald_results <- map_dfr(metabolites, function(metabolite) {
+  common_prs <- paste0(metabolite, "_common_variant_PRS")
+  rare_prs <- paste0(metabolite, "_rare_variant_PRS")
+
+  model_df <- tibble(
+    Y = metabolome_dt[[metabolite]],
+    Age = covariate_dt$Age,
+    Sex = factor(covariate_dt$Sex),
+    PRS_common = prs_dt[[common_prs]],
+    PRS_rare = prs_dt[[rare_prs]],
+    total_PXS_z = total_pxs_dt[[metabolite]]
+  ) |>
+    drop_na()
+
+  model_fit <- rms::ols(
+    Y ~ Age + Sex + PRS_common + PRS_rare + total_PXS_z,
+    data = model_df,
+    x = TRUE,
+    y = TRUE
+  )
+  total_chisq <- unname(anova(model_fit, test = "Chisq", ss = FALSE)["TOTAL", "Chi-Square"])
+
+  bind_rows(
+    extract_total(anova(model_fit, Age, Sex, test = "Chisq", ss = FALSE)) |>
+      mutate(category = "age_sex"),
+    extract_total(anova(model_fit, PRS_common, PRS_rare, test = "Chisq", ss = FALSE)) |>
+      mutate(category = "prs_common_rare"),
+    extract_total(anova(model_fit, total_PXS_z, test = "Chisq", ss = FALSE)) |>
+      mutate(category = "total_pxs_z")
+  ) |>
+    mutate(
+      metabolite = metabolite,
+      n = nobs(model_fit),
+      total_model_chisq = total_chisq,
+      relative_importance = chisq / total_chisq
+    )
+})
+
+readr::write_tsv(
+  wald_results,
+  file.path(result_dir, "wald_relative_importance.tsv")
+)
+```
+

@@ -1,0 +1,241 @@
+---
+title: "Healthy-lifestyle metabolomic signature"
+format: html
+execute:
+  eval: false
+  echo: true
+---
+
+## Setup
+
+```{r}
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(broom)
+  library(glmnet)
+})
+
+score_path <- "data/healthy_lifestyle_scores.tsv"
+metabolome_path <- "data/metabolome.tsv"
+white_id_path <- "data/white_british_ids.txt"
+result_dir <- "results/07_signature"
+dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
+
+seed <- 20240201
+nfolds <- 10
+alpha <- 0.5
+significance_cutoff <- 0.05 / 313
+
+quote_name <- function(x) {
+  paste0("`", gsub("`", "", x, fixed = TRUE), "`")
+}
+
+component_names <- c(
+  "smoking_behavior_score",
+  "alcohol_consumption_score",
+  "physical_activity_score",
+  "sleep_duration_score",
+  "sedentary_behavior_score",
+  "social_contact_score",
+  "diet_score"
+)
+```
+
+## Multivariable metabolite screening
+
+```{r}
+score_df <- readr::read_tsv(score_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(eid))
+white_ids <- readr::read_lines(white_id_path)
+metabolome_df <- readr::read_tsv(metabolome_path, show_col_types = FALSE) |>
+  mutate(eid = as.character(IID))
+
+analysis_df <- metabolome_df |>
+  inner_join(score_df, by = "eid") |>
+  filter(eid %in% white_ids)
+
+metabolites <- setdiff(names(metabolome_df), c("FID", "IID", "eid"))
+
+screening_df <- analysis_df |>
+  select(eid, healthy_lifestyle_score, all_of(metabolites)) |>
+  drop_na()
+
+screening_fit <- lm(
+  reformulate(quote_name(metabolites), response = "healthy_lifestyle_score"),
+  data = screening_df
+)
+
+screening_results <- broom::tidy(
+  screening_fit,
+  conf.int = TRUE
+) |>
+  filter(term != "(Intercept)") |>
+  transmute(
+    metabolite = stringr::str_remove_all(term, "`"),
+    estimate,
+    std.error,
+    statistic,
+    p.value,
+    conf.low,
+    conf.high,
+    n = nobs(screening_fit),
+    significant = p.value < significance_cutoff
+  ) |>
+  arrange(p.value)
+
+selected_metabolites <- screening_results |>
+  filter(significant) |>
+  pull(metabolite)
+
+readr::write_csv(
+  screening_results,
+  file.path(result_dir, "association_results.csv")
+)
+readr::write_csv(
+  screening_results |> filter(significant),
+  file.path(result_dir, "significant_metabolites.csv")
+)
+```
+
+## Individual associations for selected metabolites
+
+```{r}
+selected_metabolite_associations <- map_dfr(
+  selected_metabolites,
+  function(metabolite) {
+    model_df <- analysis_df |>
+      select(healthy_lifestyle_score, all_of(metabolite)) |>
+      drop_na()
+
+    model_fit <- lm(
+      reformulate(
+        "healthy_lifestyle_score",
+        response = quote_name(metabolite)
+      ),
+      data = model_df
+    )
+
+    broom::tidy(model_fit, conf.int = TRUE) |>
+      filter(term == "healthy_lifestyle_score") |>
+      transmute(
+        metabolite = metabolite,
+        estimate,
+        std.error,
+        statistic,
+        p.value,
+        conf.low,
+        conf.high,
+        n = nobs(model_fit)
+      )
+  }
+)
+
+readr::write_csv(
+  selected_metabolite_associations,
+  file.path(result_dir, "selected_metabolite_individual_associations.csv")
+)
+```
+
+## Outer-fold predictions with inner cross-validation
+
+```{r}
+signature_df <- analysis_df |>
+  select(eid, healthy_lifestyle_score, all_of(selected_metabolites)) |>
+  drop_na()
+
+x <- as.matrix(signature_df[, selected_metabolites, drop = FALSE])
+y <- signature_df$healthy_lifestyle_score
+
+set.seed(seed)
+fold_id <- sample(rep(seq_len(nfolds), length.out = nrow(x)))
+out_of_fold_prediction <- rep(NA_real_, nrow(x))
+
+for (fold in seq_len(nfolds)) {
+  training <- fold_id != fold
+  testing <- fold_id == fold
+
+  fold_fit <- glmnet::cv.glmnet(
+    x = x[training, , drop = FALSE],
+    y = y[training],
+    family = "gaussian",
+    alpha = alpha,
+    nfolds = nfolds,
+    standardize = TRUE
+  )
+
+  out_of_fold_prediction[testing] <- as.numeric(
+    predict(
+      fold_fit,
+      newx = x[testing, , drop = FALSE],
+      s = "lambda.min"
+    )
+  )
+}
+
+signature_predictions <- tibble(
+  IID = signature_df$eid,
+  healthy_lifestyle_score = y,
+  meta_signal = out_of_fold_prediction,
+  fold = fold_id
+)
+
+readr::write_tsv(
+  signature_predictions,
+  file.path(result_dir, "signature_predictions.tsv")
+)
+```
+
+## Final signature coefficients
+
+```{r}
+final_fit <- glmnet::cv.glmnet(
+  x = x,
+  y = y,
+  family = "gaussian",
+  alpha = alpha,
+  nfolds = nfolds,
+  standardize = TRUE
+)
+
+coefficient_matrix <- as.matrix(coef(final_fit, s = "lambda.min"))
+signature_coefficients <- tibble(
+  term = rownames(coefficient_matrix),
+  coefficient = as.numeric(coefficient_matrix[, 1])
+) |>
+  filter(coefficient != 0)
+
+readr::write_csv(
+  signature_coefficients,
+  file.path(result_dir, "signature_coefficients.csv")
+)
+```
+
+## Lifestyle-component associations of selected metabolites
+
+```{r}
+component_associations <- tidyr::crossing(
+  metabolite = selected_metabolites,
+  component = component_names
+) |>
+  mutate(
+    result = map2(metabolite, component, function(metabolite, component) {
+      model_df <- analysis_df |>
+        select(all_of(c(metabolite, component))) |>
+        drop_na()
+      model_fit <- lm(
+        reformulate(component, response = quote_name(metabolite)),
+        data = model_df
+      )
+      broom::tidy(model_fit, conf.int = TRUE) |>
+        filter(term == component) |>
+        select(estimate, std.error, statistic, p.value, conf.low, conf.high) |>
+        mutate(n = nobs(model_fit))
+    })
+  ) |>
+  tidyr::unnest(result)
+
+readr::write_csv(
+  component_associations,
+  file.path(result_dir, "metabolite_component_associations.csv")
+)
+```
