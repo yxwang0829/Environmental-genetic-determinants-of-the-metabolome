@@ -1,5 +1,5 @@
 ---
-title: "Held-out metabolite prediction models"
+title: "Five-fold metabolite prediction models"
 format: html
 execute:
   eval: false
@@ -18,120 +18,217 @@ suppressPackageStartupMessages({
 metabolome_path <- "data/heldout_metabolome.tsv"
 covariate_path <- "data/heldout_covariates.tsv"
 prs_path <- "data/heldout_prs.tsv"
-total_pxs_path <- "results/03_pxs/total_pxs_z.tsv"
+exposure_path <- "data/heldout_exposures.tsv"
+independent_exposure_path <- "results/02_independent_exposures/independent_exposures.tsv"
+total_pxs_path <- "results/03_pxs/total_pxs_raw.tsv"
 group_manifest_path <- "results/03_pxs/group_pxs_manifest.tsv"
 result_dir <- "results/04_prediction_models"
 dir.create(result_dir, recursive = TRUE, showWarnings = FALSE)
 ```
 
-## Five prediction models
+## Sample alignment and fold assignment
+
+The input tables contain held-out participants. The two field 1647 indicators
+identify country of birth. A single region-stratified split is shared by all
+metabolites and models.
 
 ```{r}
-fit_metrics <- function(formula_obj, data) {
-  model_fit <- lm(formula_obj, data = data)
-  model_summary <- summary(model_fit)
-  tibble(
-    n = nobs(model_fit),
-    r2 = model_summary$r.squared,
-    adjusted_r2 = model_summary$adj.r.squared
-  )
-}
-
 metabolome_dt <- fread(metabolome_path, check.names = FALSE)
 covariate_dt <- fread(covariate_path, check.names = FALSE)
 prs_dt <- fread(prs_path, check.names = FALSE)
+exposure_dt <- fread(exposure_path, check.names = FALSE)
 total_pxs_dt <- fread(total_pxs_path, check.names = FALSE)
+mapping_dt <- fread(independent_exposure_path, check.names = FALSE)
 
-metabolites <- setdiff(names(metabolome_dt), "IID")
+input_tables <- list(metabolome_dt, covariate_dt, prs_dt, exposure_dt, total_pxs_dt)
+ids <- Reduce(intersect, lapply(input_tables, function(x) as.character(x$IID)))
+region_dt <- exposure_dt[match(ids, as.character(IID)), .(
+  IID = as.character(IID),
+  region = fifelse(get("1647_2") == 1, "Wales",
+                   fifelse(get("1647_3") == 1, "Scotland", NA_character_))
+)][!is.na(region)]
+
+set.seed(20260919)
+region_dt[, fold := sample(rep(1:5, length.out = .N)), by = region]
+stopifnot(!anyDuplicated(region_dt$IID))
+stopifnot(all(vapply(split(region_dt$fold, region_dt$region),
+                    function(x) setequal(x, 1:5), logical(1))))
+ids <- region_dt$IID
+align_ids <- function(x) x[match(ids, as.character(x$IID))]
+metabolome_dt <- align_ids(metabolome_dt)
+covariate_dt <- align_ids(covariate_dt)
+prs_dt <- align_ids(prs_dt)
+total_pxs_dt <- align_ids(total_pxs_dt)
+write_tsv(as_tibble(region_dt), file.path(result_dir, "fold_assignments.tsv"))
+
+metabolites <- intersect(setdiff(names(total_pxs_dt), "IID"), names(metabolome_dt))
+metabolites <- metabolites[
+  paste0(metabolites, "_common_variant_PRS") %in% names(prs_dt) &
+  paste0(metabolites, "_rare_variant_PRS") %in% names(prs_dt)
+]
+
+make_model_data <- function(metabolite, pxs_dt) {
+  tibble(
+    IID = ids, fold = region_dt$fold,
+    Y = metabolome_dt[[metabolite]],
+    Age = covariate_dt$Age, Sex = factor(covariate_dt$Sex),
+    PRS_common = prs_dt[[paste0(metabolite, "_common_variant_PRS")]],
+    PRS_rare = prs_dt[[paste0(metabolite, "_rare_variant_PRS")]],
+    PXS_raw = pxs_dt[[metabolite]]
+  ) |> drop_na()
+}
+```
+
+## Cross-validation
+
+Within each metabolite and PXS score, all models use the same complete cases.
+PXS scaling parameters and model coefficients are estimated only in the training
+folds. Fold 0 denotes pooled out-of-fold performance, computed from all held-out
+predictions rather than the mean of fold-specific R² values. Negative R² values
+are retained.
+
+```{r}
+r_squared <- function(y, prediction) {
+  sst <- sum((y - mean(y))^2)
+  if (length(y) < 2L || !is.finite(sst) || sst == 0) return(NA_real_)
+  1 - sum((y - prediction)^2) / sst
+}
+
+cross_validate <- function(model_df, model_spec, group_present = TRUE) {
+  n <- nrow(model_df)
+  predictions <- matrix(NA_real_, n, length(model_spec),
+                        dimnames = list(NULL, names(model_spec)))
+  fold_metrics <- vector("list", 5L)
+
+  for (k in 1:5) {
+    train <- model_df[model_df$fold != k, ]
+    valid <- model_df[model_df$fold == k, ]
+    status <- case_when(
+      !group_present ~ "group_absent",
+      n == 0L ~ "no_complete_cases",
+      nrow(train) < 7L ~ "insufficient_training_n",
+      nrow(valid) == 0L ~ "no_validation_cases",
+      n_distinct(train$Sex) < 2L ~ "sex_single_level",
+      TRUE ~ "ok"
+    )
+    pxs_mean <- mean(train$PXS_raw)
+    pxs_sd <- sd(train$PXS_raw)
+    train$PXS_z <- (train$PXS_raw - pxs_mean) / pxs_sd
+    valid$PXS_z <- (valid$PXS_raw - pxs_mean) / pxs_sd
+
+    fold_metrics[[k]] <- map_dfr(names(model_spec), function(model_name) {
+      model_status <- status
+      training_r2 <- validation_r2 <- NA_real_
+      prediction <- rep(NA_real_, nrow(valid))
+      if (model_status == "ok" && "PXS_z" %in% all.vars(model_spec[[model_name]]) &&
+          (!is.finite(pxs_sd) || pxs_sd == 0)) {
+        model_status <- "constant_training_pxs"
+      }
+      if (model_status == "ok") {
+        fit <- lm(model_spec[[model_name]], data = train)
+        if (anyNA(coef(fit))) {
+          model_status <- "aliased_coefficient"
+        } else {
+          prediction <- as.numeric(predict(fit, newdata = valid))
+          training_r2 <- summary(fit)$r.squared
+          validation_r2 <- r_squared(valid$Y, prediction)
+        }
+      }
+      predictions[model_df$fold == k, model_name] <<- prediction
+      tibble(
+        model = model_name, fold = k, n_complete = n,
+        n_train = nrow(train), n_valid = nrow(valid),
+        n_oof = sum(is.finite(prediction)), train_r2 = training_r2,
+        validation_r2 = validation_r2, status = model_status
+      )
+    })
+  }
+  fold_metrics <- bind_rows(fold_metrics)
+  pooled <- map_dfr(names(model_spec), function(model_name) {
+    prediction <- predictions[, model_name]
+    statuses <- fold_metrics$status[fold_metrics$model == model_name]
+    complete <- n > 0L && all(statuses == "ok") && all(is.finite(prediction))
+    pooled_status <- if (complete) "pooled_ok" else if (n_distinct(statuses) == 1L) {
+      statuses[1L]
+    } else "incomplete_cv"
+    tibble(
+      model = model_name, fold = 0L, n_complete = n,
+      n_train = NA_integer_, n_valid = NA_integer_,
+      n_oof = sum(is.finite(prediction)), train_r2 = NA_real_,
+      validation_r2 = if (complete) r_squared(model_df$Y, prediction) else NA_real_,
+      status = pooled_status
+    )
+  })
+  bind_rows(fold_metrics, pooled)
+}
+```
+
+## Five prediction models
+
+```{r}
+model_spec <- list(
+  Model0 = Y ~ Age + Sex,
+  Model0b = Y ~ Age + Sex + PXS_z,
+  Model1 = Y ~ Age + Sex + PRS_common,
+  Model2 = Y ~ Age + Sex + PRS_common + PRS_rare,
+  Model3 = Y ~ Age + Sex + PRS_common + PRS_rare + PXS_z
+)
 
 model_results <- map_dfr(metabolites, function(metabolite) {
-  common_prs <- paste0(metabolite, "_common_variant_PRS")
-  rare_prs <- paste0(metabolite, "_rare_variant_PRS")
-
-  model_df <- tibble(
-    Y = metabolome_dt[[metabolite]],
-    Age = covariate_dt$Age,
-    Sex = factor(covariate_dt$Sex),
-    PRS_common = prs_dt[[common_prs]],
-    PRS_rare = prs_dt[[rare_prs]],
-    total_PXS_z = total_pxs_dt[[metabolite]]
-  ) |>
-    drop_na()
-
-  model_spec <- list(
-    Model0 = Y ~ Age + Sex,
-    Model0b = Y ~ Age + Sex + total_PXS_z,
-    Model1 = Y ~ Age + Sex + PRS_common,
-    Model2 = Y ~ Age + Sex + PRS_common + PRS_rare,
-    Model3 = Y ~ Age + Sex + PRS_common + PRS_rare + total_PXS_z
-  )
-
-  map_dfr(names(model_spec), function(model_name) {
-    fit_metrics(model_spec[[model_name]], model_df) |>
-      mutate(metabolite = metabolite, model = model_name)
-  }) |>
-    mutate(
-      delta_r2 = c(
-        NA_real_,
-        r2[model == "Model0b"] - r2[model == "Model0"],
-        r2[model == "Model1"] - r2[model == "Model0"],
-        r2[model == "Model2"] - r2[model == "Model1"],
-        r2[model == "Model3"] - r2[model == "Model2"]
-      )
-    )
+  cross_validate(make_model_data(metabolite, total_pxs_dt), model_spec) |>
+    mutate(metabolite = metabolite)
 })
 
-readr::write_tsv(
-  model_results,
-  file.path(result_dir, "model_metrics.tsv")
-)
+contributions <- model_results |>
+  filter(fold == 0L) |>
+  select(metabolite, n_complete, model, validation_r2) |>
+  pivot_wider(names_from = model, values_from = validation_r2) |>
+  mutate(
+    common_prs = Model1 - Model0,
+    rare_prs = Model2 - Model1,
+    PXS_vs_base = Model0b - Model0,
+    PRS_vs_base = Model2 - Model0,
+    PXS_given_PRS = Model3 - Model2,
+    PRS_given_PXS = Model3 - Model0b,
+    genetic_total = Model2 - Model0,
+    joint_vs_base = Model3 - Model0
+  )
+
+write_tsv(model_results, file.path(result_dir, "cv_model_metrics.tsv"))
+write_tsv(contributions, file.path(result_dir, "cv_prs_pxs_contributions.tsv"))
 ```
 
 ## Exposure-group models
 
 ```{r}
-group_manifest <- readr::read_tsv(group_manifest_path, show_col_types = FALSE)
+group_spec <- list(
+  base = Y ~ Age + Sex,
+  group_PXS = Y ~ Age + Sex + PXS_z,
+  genetic = Y ~ Age + Sex + PRS_common + PRS_rare,
+  genetic_group_PXS = Y ~ Age + Sex + PRS_common + PRS_rare + PXS_z
+)
+group_manifest <- read_tsv(group_manifest_path, show_col_types = FALSE)
 
 group_model_results <- pmap_dfr(group_manifest, function(group, group_key, path) {
-  group_pxs_dt <- fread(path, check.names = FALSE)
-
+  group_pxs_dt <- align_ids(fread(path, check.names = FALSE))
   map_dfr(metabolites, function(metabolite) {
-    common_prs <- paste0(metabolite, "_common_variant_PRS")
-    rare_prs <- paste0(metabolite, "_rare_variant_PRS")
-
-    model_df <- tibble(
-      Y = metabolome_dt[[metabolite]],
-      Age = covariate_dt$Age,
-      Sex = factor(covariate_dt$Sex),
-      PRS_common = prs_dt[[common_prs]],
-      PRS_rare = prs_dt[[rare_prs]],
-      group_PXS_z = group_pxs_dt[[metabolite]]
-    ) |>
-      drop_na()
-
-    baseline_fit <- fit_metrics(Y ~ Age + Sex, model_df)
-    exposure_fit <- fit_metrics(Y ~ Age + Sex + group_PXS_z, model_df)
-    genetic_fit <- fit_metrics(
-      Y ~ Age + Sex + PRS_common + PRS_rare + group_PXS_z,
-      model_df
-    )
-
-    bind_rows(
-      exposure_fit |> mutate(model = "age_sex_group_pxs"),
-      genetic_fit |> mutate(model = "age_sex_prs_group_pxs")
-    ) |>
-      mutate(
-        metabolite = metabolite,
-        group = group,
-        delta_r2_from_age_sex = r2 - baseline_fit$r2
-      )
+    present <- any(mapping_dt$Metabolite == metabolite & mapping_dt$Category == group)
+    cross_validate(make_model_data(metabolite, group_pxs_dt), group_spec, present) |>
+      mutate(metabolite = metabolite, group = group)
   })
 })
 
-readr::write_tsv(
-  group_model_results,
-  file.path(result_dir, "group_model_metrics.tsv")
-)
+group_contributions <- group_model_results |>
+  filter(fold == 0L) |>
+  select(metabolite, group, n_complete, model, validation_r2) |>
+  pivot_wider(names_from = model, values_from = validation_r2) |>
+  mutate(
+    group_pxs_vs_base = group_PXS - base,
+    group_pxs_given_prs = genetic_group_PXS - genetic
+  )
+
+write_tsv(group_model_results, file.path(result_dir, "cv_group_model_metrics.tsv"))
+write_tsv(group_contributions, file.path(result_dir, "cv_group_contributions.tsv"))
 ```
 
 ## Wald chi-square relative importance
@@ -146,18 +243,17 @@ extract_total <- function(anova_table) {
 }
 
 wald_results <- map_dfr(metabolites, function(metabolite) {
-  common_prs <- paste0(metabolite, "_common_variant_PRS")
-  rare_prs <- paste0(metabolite, "_rare_variant_PRS")
-
-  model_df <- tibble(
-    Y = metabolome_dt[[metabolite]],
-    Age = covariate_dt$Age,
-    Sex = factor(covariate_dt$Sex),
-    PRS_common = prs_dt[[common_prs]],
-    PRS_rare = prs_dt[[rare_prs]],
-    total_PXS_z = total_pxs_dt[[metabolite]]
-  ) |>
-    drop_na()
+  model_df <- make_model_data(metabolite, total_pxs_dt)
+  if (nrow(model_df) < 7L || n_distinct(model_df$Sex) < 2L ||
+      !is.finite(sd(model_df$PXS_raw)) || sd(model_df$PXS_raw) == 0) {
+    return(tibble(
+      metabolite = metabolite,
+      category = c("age_sex", "prs_common_rare", "total_pxs_z"),
+      n = nrow(model_df), chisq = NA_real_, df = NA_integer_, p = NA_real_,
+      total_model_chisq = NA_real_, relative_importance = NA_real_
+    ))
+  }
+  model_df$total_PXS_z <- as.numeric(scale(model_df$PXS_raw))
 
   model_fit <- rms::ols(
     Y ~ Age + Sex + PRS_common + PRS_rare + total_PXS_z,
